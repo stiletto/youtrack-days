@@ -1,0 +1,100 @@
+#!/usr/bin/env python
+import requests, datetime, sys, os, threading
+from ConfigParser import SafeConfigParser
+from xml.dom.minidom import parseString
+
+config = SafeConfigParser()
+config.read(os.path.join(os.getenv('HOME'),'.youtrack-days.ini'))
+base = config.get('auth','base')+'rest'
+r = requests.post(base+'/user/login', params={
+    "login": config.get('auth','user'),
+    "password": config.get('auth','password')})
+cookies = r.cookies
+if r.status_code != 200:
+    print r.status_code, r.text
+    exit()
+
+def parseshit(x):
+    return ''.join(child.nodeValue for child in x.childNodes)
+offset = 0
+
+ppl = {}
+summaries = {}
+today = datetime.date.today()
+thismonth = datetime.date(year=today.year, month=today.month, day=1)
+
+while True:
+    sys.stderr.write(str(offset)+'...')
+    sys.stderr.flush()
+    r = requests.get(base+'/issue?with=id&with=summary', params={
+        "filter":"updated: {This month}",
+        "after": str(offset)}, cookies=cookies)
+    issues = []
+    for x in parseString(r.content).getElementsByTagName('issueCompacts')[0].childNodes:
+        id = x.getAttribute('id')
+        summary = '...'
+        for field in x.getElementsByTagName('field'):
+            if field.getAttribute('name')=='summary':
+                summary = parseshit(field.getElementsByTagName('value')[0])
+        issues.append([id,summary])
+    if len(issues)==0:
+        break
+    offset += len(issues)
+
+    class TrackingLoader(threading.Thread):
+        def __init__(self, issue):
+            threading.Thread.__init__(self)
+            self.issue=issue
+        def run(self):
+            r = requests.get(base+'/issue/%s/timetracking/workitem/' % (self.issue,), cookies=cookies)
+            self.works = parseString(r.content).getElementsByTagName('workItems')[0].childNodes
+
+    loaders = dict((issue[0],TrackingLoader(issue[0])) for issue in issues)
+    for loader in loaders.itervalues():
+        loader.daemon=True
+        loader.start()
+    for loader in loaders.itervalues():
+        loader.join()
+
+    #for issue in issues:
+    #    r = requests.get(base+'/issue/%s/timetracking/workitem/' % (issue[0],), cookies=cookies)
+
+    for issue in issues:
+        works = loaders[issue[0]].works
+        summaries[issue[0]] = issue[1]
+        for work in works:
+            author = work.getElementsByTagName('author')[0].getAttribute('login')
+            date = datetime.date.fromtimestamp(int(parseshit(work.getElementsByTagName('date')[0]))/1000)
+            if date < thismonth:
+                continue
+            duration = int(parseshit(work.getElementsByTagName('duration')[0]))
+            if duration==0:
+                continue
+            if author not in ppl:
+                ppl[author]={}
+            if date not in ppl[author]:
+                ppl[author][date]={}
+            ppl[author][date][issue[0]] = ppl[author][date].get(issue[0],0) + int(duration)
+sys.stderr.write('done.\n')
+sys.stderr.flush()
+
+def byauthor(author):
+    days = ppl[author]
+    print ('--- '+author+' ').ljust(80,'-')
+    dayids = days.keys()
+    dayids.sort()
+    total = 0
+    for day in dayids:
+        issues=days[day]
+        time = sum(issues.itervalues())/60.0
+        total += time
+        issues = ', '.join(issue+' ('+summaries[issue]+')' for issue in issues)
+        print "%s | %5.1f | %s" % (day, time, issues.encode('utf-8', 'replace'))
+        sys.stdout.flush()
+    print '%d-%02d    | %5.1f | Total time this month' % (thismonth.year, thismonth.month, total)
+
+if len(sys.argv)>1:
+    byauthor(sys.argv[1])
+else:
+    for author in ppl:
+        byauthor(author)
